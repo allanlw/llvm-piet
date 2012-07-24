@@ -1,0 +1,10 @@
+begin
+	integer x;
+	x := 20;
+	begin
+		integer y;
+		y:= 10
+	end;
+	printn(x);
+	prints("\n")
+end

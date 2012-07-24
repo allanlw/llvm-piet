@@ -1,0 +1,8 @@
+begin
+	prints("Hello World!");
+	print();
+	printn(200+900);
+	print();
+	printc(65);
+	print()
+end
