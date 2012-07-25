@@ -367,11 +367,11 @@ def run_opt(mod, pm, name, verbose, min = 1):
       print "Running passes '"+name+"'..."
     pm.run(mod)
     mod.verify()
-    if verbose:
-      print "Done running passes '"+name+"'..."
     now = str(mod).count("\n")
     now_funcs = len(mod.functions)
     i += 1
+    if verbose:
+      print "Done running passes '{0}'... (len: {1}, funcs: {2})".format(name, now, now_funcs)
     if ((min < 0 and i*-1 == min) or
         (now >= last and now_funcs >= funcs and i >= min)):
       break
@@ -504,12 +504,13 @@ def main():
 #   it's worth it.
     pm.add(llvm.passes.PASS_LOWER_SWITCH)
     pm.add(llvm.passes.PASS_JUMP_THREADING)
+    pm.add(llvm.passes.PASS_INSTRUCTION_COMBINING)
     pm.add(llvm.passes.PASS_CFG_SIMPLIFICATION)
     pm.add(llvm.passes.PASS_AGGRESSIVE_DCE)
 
     del a
 
-    run_opt(mod, pm, "general", args.verbose, 4)
+    run_opt(mod, pm, "general", args.verbose, 8)
 
     for fun in mod.functions:
       if fun.name!= "main" and not fun.is_declaration:
@@ -520,6 +521,9 @@ def main():
 
     pm2 = llvm.passes.PassManager.new()
     pm2.add(llvm.ee.TargetData.new('') )
+#    pm2.add(llvm.passes.PASS_LOOP_SIMPLIFY)
+#    pm2.add(llvm.passes.PASS_IND_VAR_SIMPLIFY)
+#    pm2.add(llvm.passes.PASS_LOOP_UNROLL)
     pm2.add(llvm.passes.PASS_FUNCTION_ATTRS)
     pm2.add(llvm.passes.PASS_FUNCTION_INLINING)
     # doing this breaks future piet passes but oh well
@@ -533,7 +537,7 @@ def main():
     pm2.add(llvm.passes.PASS_DEAD_ARG_ELIMINATION)
     pm2.add(llvm.passes.PASS_DEAD_TYPE_ELIMINATION)
 
-    pm2.run(mod)
+    run_opt(mod, pm2, "cleanup", args.verbose, -1)
   if args.ass:
     args.out.write(str(mod))
   else:

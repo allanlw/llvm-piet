@@ -29,7 +29,7 @@ def printf(mod, bu, s, *args):
   bu.call(pf, (t,)+(args))
 
 def debug(mod, bu, inst, codel):
-  s = "{0}(X:{1} Y:{2} E:{3} OC:{5} NC:{6} S:{4})".format(inst, *codel)
+  s = "{0}(X:{1} Y:{2} E:{3})".format(inst, *codel)
   v = str_const(mod, s, s)
   d = mod.get_function_named("debug")
   t = bu.gep(v, [Constant.int(Type.int(), 0), Constant.int(Type.int(), 0)])
@@ -50,7 +50,7 @@ def setup_module():
   for function in mod.functions:
     if function.is_declaration:
       continue
-    function.linkage = llvm.core.LINKAGE_INTERNAL
+    function.linkage = llvm.core.LINKAGE_EXTERNAL
     function.add_attribute(llvm.core.ATTR_NO_INLINE)
 #    function.calling_convention = llvm.core.CC_FASTCALL
 #  for g in mod.global_variables:

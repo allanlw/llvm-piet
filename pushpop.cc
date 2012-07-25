@@ -9,6 +9,8 @@ typedef int data_type;
 
 static list<data_type>* stack = NULL;
 
+const static char* zls = "Error: %s with zero length stack.\n";
+
 extern "C" void print_stack(void) {
   if (stack != NULL) {
     list<data_type>::iterator i=stack->begin(), end=stack->end(), aend=end;
@@ -29,8 +31,9 @@ extern "C" void debug(char* instname) {
 
 extern "C" int peek(void) {
   if (stack == NULL || stack->size() == 0) {
-    fprintf(stderr, "Error: Peek with zero length stack.");
+    fprintf(stderr, zls, "peek");
     exit(1);
+    return 0;
   }
   return stack->back();
 }
@@ -43,8 +46,9 @@ extern "C" void push(int e) {
 
 extern "C" int pop(void) {
   if (stack == NULL || stack->size() == 0) {
-    fprintf(stderr, "Error: Pop with zero length stack.");
+    fprintf(stderr, zls, "pop");
     exit(1);
+    return 0;
   }
   data_type e = stack->back();
   stack->pop_back();
@@ -53,16 +57,19 @@ extern "C" int pop(void) {
 
 extern "C" void roll(int depth, int times) {
   if (stack == NULL) {
-    fprintf(stderr, "Error: Roll with zero length stack.");
+    fprintf(stderr, zls, "roll");
     exit(1);
+    return;
   } else if (depth > stack->size()) {
     fprintf(stderr,
         "Error: Roll with depth (%d) larger than stack size (%d).",
         depth, stack->size());
     exit(1);
+    return;
   } else if (depth <= 0) {
     fprintf(stderr, "Error: Roll with zero or negative depth (%d).", depth);
     exit(1);
+    return;
   }
   while (times < 0) {
     times += depth;
@@ -73,6 +80,6 @@ extern "C" void roll(int depth, int times) {
   list<data_type>::iterator it2 = stack->end();
   advance(it2, -times);
   list<data_type>::iterator it1 = it2;
-  advance(it2, -(depth-times));
+  advance(it1, -(depth-times));
   stack->splice(it1, *stack, it2, stack->end());
 }
