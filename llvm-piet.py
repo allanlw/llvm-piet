@@ -481,6 +481,12 @@ def main():
     a = ctypes.py_object(pm.ptr)
 
     pm.add( llvm.ee.TargetData.new('') )
+
+    pm.add(llvm.passes.PASS_LOOP_ROTATE)
+    pm.add(llvm.passes.PASS_LOOP_SIMPLIFY)
+    pm.add(llvm.passes.PASS_IND_VAR_SIMPLIFY)
+#    pm.add(llvm.passes.PASS_LOOP_UNROLL)
+
     pm.add(llvm.passes.PASS_BASIC_ALIAS_ANALYSIS)
     pm.add(llvm.passes.PASS_INSTRUCTION_COMBINING)
     pm.add(llvm.passes.PASS_REASSOCIATE)

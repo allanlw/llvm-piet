@@ -12,6 +12,7 @@
 #include <llvm/Support/CallSite.h>
 #include <llvm/PassManagers.h>
 #include <llvm/Constants.h>
+#include <llvm/Use.h>
 
 // LLVM-C includes
 #include <llvm-c/Core.h>
@@ -28,95 +29,6 @@ using namespace llvm;
 static bool isText(std::string t) {
   return (t=="printf"||t=="puts"||t=="putc"||t=="debug"||t=="scanf");
 }
-
-// This pass finds pops and peeks in the entry block of functions
-// and moves them to the call site with the result being passed as a parameter
-// to the function
-struct InterFuncMovePass : public ModulePass {
-  static char ID;
-  InterFuncMovePass() : ModulePass(ID) {}
-
-  virtual bool runOnModule(Module& m) {
-    return this->_runOnModule(m);
-  }
-
-  void getAnalysisUsage(AnalysisUsage &info) const {
-  }
-
-private:
-  bool _runOnModule(Module& m, bool ret = false) {
-    Module::iterator b = m.begin(), e = m.end();
-    for (; b != e; ++b) {
-      if (b->getName().str().find("codel") != 0) {
-        continue;
-      }
-      BasicBlock& bb = b->getEntryBlock();
-      BasicBlock::iterator bb_i = bb.begin(), bb_e = bb.end();
-      for (; bb_i != bb_e; ++bb_i) {
-        CallInst *a;
-        if (!(a = dyn_cast<CallInst>(bb_i))) {
-          continue;
-        }
-        std::string name = a->getCalledFunction()->getName().str();
-        // heavily inspired by DeadArgElimination.cpp
-        if (name == "peek" || name == "pop") {
-          return this->_doMove(b, a);
-        } else if (name == "roll" || name == "push") {
-          break;
-        }
-      }
-    }
-    return ret;
-  }
-
-  bool _doMove(Function* b, CallInst* a) {
-    Module* m = b->getParent();
-    std::string name = a->getCalledFunction()->getName().str();
-    const FunctionType* Fty = b->getFunctionType();
-
-    std::vector<const Type*> params(Fty->param_begin(), Fty->param_end());
-    params.push_back(a->getType());
-    FunctionType* NFty = FunctionType::get(Fty->getReturnType(),
-       params, false);
-
-    Function *NF = Function::Create(NFty, b->getLinkage());
-
-    NF->copyAttributesFrom(b);
-    NF->takeName(b);
-
-    m->getFunctionList().insert(b, NF);
-
-    while (!b->use_empty()) {
-      CallSite CS(b->use_back());
-      Instruction* call = CS.getInstruction();
-      std::vector<Value*> args(CS.arg_begin(), CS.arg_end());
-
-      CallInst* p = CallInst::Create(m->getFunction(name));
-      p->insertBefore(call);
-      args.push_back(p);
-
-      CallInst* N = CallInst::Create(NF, args.begin(), args.end());
-      N->setCallingConv(CS.getCallingConv());
-      N->setTailCall(cast<CallInst>(CS.getInstruction())->isTailCall());
-      N->insertBefore(call);
-
-      call->replaceAllUsesWith(N);
-      call->eraseFromParent();
-    }
-    NF->getBasicBlockList().splice(NF->begin(), b->getBasicBlockList());
-
-    Function::arg_iterator in = NF->arg_begin(), io = b->arg_begin(),
-        eo = b->arg_end();
-    for(; io != eo; ++io, ++in) {
-      io->replaceAllUsesWith(in);
-    }
-    a->replaceAllUsesWith(in);
-    a->eraseFromParent();
-
-    b->eraseFromParent();
-    return this->_runOnModule(*m, true);
-  }
-};
 
 // This pass does basic 'peephole' optimization of basic blocks
 // merging obviously redundant stack operations and text operations
@@ -142,29 +54,21 @@ struct PushPopMergePass : public BasicBlockPass {
         continue;
       }
       std::string name1 = a->getCalledFunction()->getName().str();
-      if (name1 == "roll") {
-        if (unrollRoll(a)) {
-          return _runOnBasicBlock(BB, true);
-        } else {
-           continue;
-        }
-      } else if (name1 == "printf") {
-        if (reducePrintf(a)) {
-          return _runOnBasicBlock(BB, true);
-        }
-        /* explicit fall through...*/
-      } else if (name1 == "peek") {
-        if (a->use_empty()) {
-          a->eraseFromParent();
-          return _runOnBasicBlock(BB, true);
-        }
-        /* explicit fall through...*/
-      } else if (name1 != "push" && name1 != "pop" && name1 != "debug")
+      if ((name1 == "roll" && unrollRoll(a)) ||
+          (name1 == "printf" && reducePrintf(a))) {
+        return _runOnBasicBlock(BB, true);
+      } else if (name1 == "peek" && a->use_empty()) {
+        a->eraseFromParent();
+        return _runOnBasicBlock(BB, true);
+      } else if (name1 != "push" && name1 != "pop" && name1 != "debug" &&
+          name1 != "roll" && name1 != "printf" && name1 != "peek") {
         continue;
+      }
       BasicBlock::iterator it2(it); ++it2;
       for (; it2 != end; ++it2) {
         if (!(b = dyn_cast<CallInst>(it2))) {
           ReturnInst* d;
+          // useless instructions before returns can be dumped
           if ((d = dyn_cast<ReturnInst>(it2)) && (name1 == "push" ||
               name1 == "roll" || ((name1 == "pop" || name1 == "peek") &&
               a->use_empty()))) {
@@ -344,6 +248,140 @@ struct PushPopMergePass : public BasicBlockPass {
     return false;
   }
 };
+
+// This pass finds pops and peeks in the entry block of functions
+// and moves them to the call site with the result being passed as a parameter
+// to the function
+struct InterFuncMovePass : public ModulePass {
+  static char ID;
+  InterFuncMovePass() : ModulePass(ID) {}
+
+  virtual bool runOnModule(Module& m) {
+    return this->_runOnModule(m);
+  }
+
+  void getAnalysisUsage(AnalysisUsage &info) const {
+  }
+
+private:
+  bool _runOnModule(Module& m, bool ret = false) {
+    Module::iterator b = m.begin(), e = m.end();
+    for (; b != e; ++b) {
+      if (b->getName().str().find("codel") != 0) {
+        continue;
+      }
+      // if there is a 'pop' or a 'peek' in the entry block
+      // shuffle it out
+      BasicBlock& bb = b->getEntryBlock();
+      BasicBlock::iterator bb_i = bb.begin(), bb_e = bb.end();
+      for (; bb_i != bb_e; ++bb_i) {
+        CallInst *a;
+        if (!(a = dyn_cast<CallInst>(bb_i))) {
+          continue;
+        }
+        std::string name = a->getCalledFunction()->getName().str();
+        // heavily inspired by DeadArgElimination.cpp
+        if (name == "peek" || name == "pop") {
+          _doMove(b, a);
+          return _runOnModule(m, true);
+        } else if (name == "roll" || name == "push") {
+          break;
+        }
+      }
+      // if there is a push directly before every single call site
+      // shuffle it in
+      Function::use_iterator ui(b->use_begin()), ue(b->use_end());
+      unsigned numFound = 0;
+      unsigned numNotFound = 0;
+      for (; ui != ue; ++ui) {
+        CallSite CS(*ui);
+        Instruction* Call = CS.getInstruction();
+        BasicBlock::iterator ic(Call), ib = Call->getParent()->begin();
+        if (ic == Call->getParent()->begin()) {
+          numNotFound++;
+          break;
+        }
+        bool found = false;
+        do {
+          --ic;
+          CallInst* cic;
+          if (!(cic = dyn_cast<CallInst>(ic))) continue;
+          std::string cicn = cic->getCalledFunction()->getName().str();
+          if (cicn == "push") {
+            found = true;
+            break;
+          } else if (cicn == "pop" || cicn == "roll" || cicn == "peek") {
+            break;
+          }
+        } while (ic != ib);
+        if (found) ++numFound;
+        else ++numNotFound;
+      }
+      // if the number of instructions that I am going to get rid of is
+      // more than the number of instructions that I am going to create
+      if (numFound >= numNotFound + 1) {
+        Function* NF = addFunctionParamWithCall(*b, m.getFunction("pop"));
+        CallInst::Create(m.getFunction("push"), --NF->arg_end(),
+            "", NF->getEntryBlock().getFirstNonPHI());
+        return _runOnModule(m, true);
+      }
+    }
+    return ret;
+  }
+
+  static void _doMove(Function* b, CallInst* a) {
+    Function *NF = addFunctionParamWithCall(*b, a->getCalledFunction());
+    a->replaceAllUsesWith(--NF->arg_end());
+    a->eraseFromParent();
+  }
+
+  static Function* addFunctionParamWithCall(Function& f, Function* newCall) {
+    Module* m = f.getParent();
+    const FunctionType* Fty = f.getFunctionType();
+
+    std::vector<const Type*> params(Fty->param_begin(), Fty->param_end());
+    params.push_back(newCall->getReturnType());
+    FunctionType* NFty = FunctionType::get(Fty->getReturnType(),
+       params, false);
+
+    Function *NF = Function::Create(NFty, f.getLinkage());
+
+    NF->copyAttributesFrom(&f);
+    NF->takeName(&f);
+
+    m->getFunctionList().insert(&f, NF);
+
+    while (!f.use_empty()) {
+      CallSite CS(f.use_back());
+      Instruction* call = CS.getInstruction();
+      std::vector<Value*> args(CS.arg_begin(), CS.arg_end());
+
+      CallInst* p = CallInst::Create(newCall);
+      p->insertBefore(call);
+      args.push_back(p);
+
+      CallInst* N = CallInst::Create(NF, args.begin(), args.end());
+      N->setCallingConv(CS.getCallingConv());
+      N->setTailCall(cast<CallInst>(CS.getInstruction())->isTailCall());
+      N->insertBefore(call);
+
+      call->replaceAllUsesWith(N);
+      call->eraseFromParent();
+      PushPopMergePass::_runOnBasicBlock(*N->getParent());
+    }
+    NF->getBasicBlockList().splice(NF->begin(), f.getBasicBlockList());
+
+    Function::arg_iterator in = NF->arg_begin(), io = f.arg_begin(),
+        eo = f.arg_end();
+    for(; io != eo; ++io, ++in) {
+      io->replaceAllUsesWith(in);
+    }
+    f.eraseFromParent();
+    return NF;
+  }
+};
+
+
 
 // this function find predecessors with pushes and moves them into itself
 struct InterBlockMergePass : public FunctionPass {
@@ -593,10 +631,23 @@ struct ModCleanupPass : public ModulePass {
     unsigned peeks = countFunctionUses(m, "peek"),
         pops = countFunctionUses(m, "pop"),
         pushes = countFunctionUses(m, "push"),
-        rolls = countFunctionUses(m, "roll");
+        rolls = countFunctionUses(m, "roll"),
+        pops_used = countFunctionReturnUses(m, "pop"),
+        peeks_used = countFunctionReturnUses(m, "peek");
     bool res = false;
-    if (peeks == 0 && pops == 0 && rolls == 0) {
+    // WARNING THIS COULD GET RID OF WARNING MESSAGES
+    if (pops_used == 0 && peeks_used == 0) {
+      deleteAllCalls(m, "pop");
+      deleteAllCalls(m, "peek");
+      peeks = 0;
+      pops = 0;
+      res = true;
+    }
+    if (peeks == 0 && pops == 0) {
       deleteAllCalls(m, "push");
+      deleteAllCalls(m, "roll");
+      pushes = 0;
+      rolls = 0;
       res = true;
     }
     return res;
@@ -605,6 +656,18 @@ struct ModCleanupPass : public ModulePass {
   static unsigned countFunctionUses(Module& m, std::string n) {
     Function* f = m.getFunction(n);
     return f->getNumUses();
+  }
+
+  static unsigned countFunctionReturnUses(Module& m, std::string n) {
+    Function *f = m.getFunction(n);
+    Function::use_iterator ui(f->use_begin()), ue(f->use_end());
+    unsigned count = 0;
+    for (; ui != ue; ++ui) {
+      CallSite CS(*ui);
+      Instruction* i = CS.getInstruction();
+      if (!i->use_empty()) count++;
+    }
+    return count;
   }
 
   static void deleteAllCalls(Module& m, std::string n) {
