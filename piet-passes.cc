@@ -1,21 +1,16 @@
-// Python includes
-#include <Python.h>
-
-// LLVM includes
 #include <llvm/Pass.h>
 #include <llvm/Support/CFG.h>
 #include <llvm/Function.h>
 #include <llvm/Instructions.h>
 #include <llvm/BasicBlock.h>
 #include <llvm/PassManager.h>
+#include <llvm/Module.h>
+#include <llvm/Operator.h>
 #include <llvm/Support/IRBuilder.h>
 #include <llvm/Support/CallSite.h>
 #include <llvm/PassManagers.h>
 #include <llvm/Constants.h>
 #include <llvm/Use.h>
-
-// LLVM-C includes
-#include <llvm-c/Core.h>
 
 #include <iostream>
 #include <sstream>
@@ -26,8 +21,11 @@
 
 using namespace llvm;
 
+namespace {
+
 static bool isText(std::string t) {
-  return (t=="printf"||t=="puts"||t=="putc"||t=="debug"||t=="scanf");
+  return (t=="printf"||t=="puts"||t=="putc"||t=="debug"||t=="scanf"||
+      t=="llvm.lifetime.begin"||t=="llvm.lifetime.end");
 }
 
 // This pass does basic 'peephole' optimization of basic blocks
@@ -156,7 +154,7 @@ struct PushPopMergePass : public BasicBlockPass {
       }
     }
     IRBuilder<> bu(&BB, a);
-    Value* v1 = bu.CreateGlobalStringPtr(format.c_str());
+    Value* v1 = bu.CreateGlobalStringPtr(format);
     bu.CreateCall(a->getCalledFunction(), v1);
     a->eraseFromParent();
     return true;
@@ -188,7 +186,7 @@ struct PushPopMergePass : public BasicBlockPass {
     nc.resize(nc.size()-1); // chop off null terminator
 
     IRBuilder<> bu(&BB, b);
-    Value* st = bu.CreateGlobalStringPtr(nc.c_str());
+    Value* st = bu.CreateGlobalStringPtr(nc);
     std::vector<Value*> arguments;
     arguments.push_back(st);
     size_t i;
@@ -198,7 +196,7 @@ struct PushPopMergePass : public BasicBlockPass {
     for (i = 1; i < b->getNumArgOperands(); i++) {
       arguments.push_back(b->getArgOperand(i));
     }
-    bu.CreateCall(a->getCalledFunction(), arguments.begin(), arguments.end());
+    bu.CreateCall(a->getCalledFunction(), arguments);
     a->eraseFromParent();
     b->eraseFromParent();
     return true;
@@ -249,9 +247,9 @@ struct PushPopMergePass : public BasicBlockPass {
   }
 };
 
-// This pass finds pops and peeks in the entry block of functions
-// and moves them to the call site with the result being passed as a parameter
-// to the function
+// If most call sites for a function are preceded by pushes, we
+// move the pushes into the entry block of the function and pass
+// the values that would have been pushes as parameters.
 struct InterFuncMovePass : public ModulePass {
   static char ID;
   InterFuncMovePass() : ModulePass(ID) {}
@@ -270,58 +268,9 @@ private:
       if (b->getName().str().find("codel") != 0) {
         continue;
       }
-      // if there is a 'pop' or a 'peek' in the entry block
-      // shuffle it out
-      BasicBlock& bb = b->getEntryBlock();
-      BasicBlock::iterator bb_i = bb.begin(), bb_e = bb.end();
-      for (; bb_i != bb_e; ++bb_i) {
-        CallInst *a;
-        if (!(a = dyn_cast<CallInst>(bb_i))) {
-          continue;
-        }
-        std::string name = a->getCalledFunction()->getName().str();
-        // heavily inspired by DeadArgElimination.cpp
-        if (name == "peek" || name == "pop") {
-          _doMove(b, a);
-          return _runOnModule(m, true);
-        } else if (name == "roll" || name == "push") {
-          break;
-        }
-      }
-      // if there is a push directly before every single call site
-      // shuffle it in
-      Function::use_iterator ui(b->use_begin()), ue(b->use_end());
-      unsigned numFound = 0;
-      unsigned numNotFound = 0;
-      for (; ui != ue; ++ui) {
-        CallSite CS(*ui);
-        Instruction* Call = CS.getInstruction();
-        BasicBlock::iterator ic(Call), ib = Call->getParent()->begin();
-        if (ic == Call->getParent()->begin()) {
-          numNotFound++;
-          break;
-        }
-        bool found = false;
-        do {
-          --ic;
-          CallInst* cic;
-          if (!(cic = dyn_cast<CallInst>(ic))) continue;
-          std::string cicn = cic->getCalledFunction()->getName().str();
-          if (cicn == "push") {
-            found = true;
-            break;
-          } else if (cicn == "pop" || cicn == "roll" || cicn == "peek") {
-            break;
-          }
-        } while (ic != ib);
-        if (found) ++numFound;
-        else ++numNotFound;
-      }
-      // if the number of instructions that I am going to get rid of is
-      // more than the number of instructions that I am going to create
-      if (numFound >= numNotFound + 1) {
+      if (mostCallSitesPreceededBy(b, "push")) {
         Function* NF = addFunctionParamWithCall(*b, m.getFunction("pop"));
-        CallInst::Create(m.getFunction("push"), --NF->arg_end(),
+        CallInst::Create(m.getFunction("push"), &*(--NF->arg_end()),
             "", NF->getEntryBlock().getFirstNonPHI());
         return _runOnModule(m, true);
       }
@@ -329,17 +278,43 @@ private:
     return ret;
   }
 
-  static void _doMove(Function* b, CallInst* a) {
-    Function *NF = addFunctionParamWithCall(*b, a->getCalledFunction());
-    a->replaceAllUsesWith(--NF->arg_end());
-    a->eraseFromParent();
+  static bool mostCallSitesPreceededBy(Function* b, std::string a) {
+    Function::use_iterator ui(b->use_begin()), ue(b->use_end());
+    unsigned numFound = 0;
+    unsigned numNotFound = 0;
+    for (; ui != ue; ++ui) {
+      CallSite CS(*ui);
+      Instruction* Call = CS.getInstruction();
+      BasicBlock::iterator ic(Call), ib = Call->getParent()->begin();
+      if (ic == Call->getParent()->begin()) {
+        numNotFound++;
+        break;
+      }
+      bool found = false;
+      do {
+        --ic;
+        CallInst* cic;
+        if (!(cic = dyn_cast<CallInst>(ic))) continue;
+        std::string cicn = cic->getCalledFunction()->getName().str();
+        if (cicn == a) {
+          found = true;
+          break;
+        } else if (cicn == "pop" || cicn == "roll" || cicn == "peek" ||
+            cicn=="push") {
+          break;
+        }
+      } while (ic != ib);
+      if (found) ++numFound;
+      else ++numNotFound;
+    }
+    return numFound >= numNotFound + 1;
   }
 
   static Function* addFunctionParamWithCall(Function& f, Function* newCall) {
     Module* m = f.getParent();
     const FunctionType* Fty = f.getFunctionType();
 
-    std::vector<const Type*> params(Fty->param_begin(), Fty->param_end());
+    std::vector<Type*> params(Fty->param_begin(), Fty->param_end());
     params.push_back(newCall->getReturnType());
     FunctionType* NFty = FunctionType::get(Fty->getReturnType(),
        params, false);
@@ -360,7 +335,7 @@ private:
       p->insertBefore(call);
       args.push_back(p);
 
-      CallInst* N = CallInst::Create(NF, args.begin(), args.end());
+      CallInst* N = CallInst::Create(NF, args);
       N->setCallingConv(CS.getCallingConv());
       N->setTailCall(cast<CallInst>(CS.getInstruction())->isTailCall());
       N->insertBefore(call);
@@ -381,9 +356,8 @@ private:
   }
 };
 
-
-
-// this function find predecessors with pushes and moves them into itself
+// this function find predecessor basic blocks with pushes
+// and moves them into itself using phi nodes.
 struct InterBlockMergePass : public FunctionPass {
   static char ID;
   InterBlockMergePass() : FunctionPass(ID) {}
@@ -393,21 +367,24 @@ struct InterBlockMergePass : public FunctionPass {
   }
 
   void getAnalysisUsage(AnalysisUsage &info) const {
-//    info.addRequired<InterFuncMovePass>();
   }
 
 private:
   // returns true if this basic block is a candidate for cross-block
   // call merging using phis
   bool basicBlockIsOperable(BasicBlock& bb) {
-    CallInst *a;
-    if (!(a = dyn_cast<CallInst>(bb.getFirstNonPHI()))) {
-      return false;
+    bool flag = true;
+    for (BasicBlock::iterator ia = bb.begin(), ie = bb.end(); ia != ie; ++ia) {
+      if (!isa<CallInst>(*&ia)) {
+        continue;
+      }
+      std::string name = cast<CallInst>(ia)->getCalledFunction()->getName().str();
+      if (name == "peek" || name == "pop" || name == "roll") {
+        flag = false;
+        break;
+      } else if (name == "push") return false;
     }
-    std::string name = a->getCalledFunction()->getName().str();
-    if (name != "peek" && name != "pop" && name != "roll") {
-      return false;
-    }
+    if (flag) return false;
     pred_iterator end3 = pred_end(&bb), it3=pred_begin(&bb);
     if (it3 == end3) {
       return false;
@@ -421,7 +398,7 @@ private:
         continue;
       }
       bool flag = false;
-      // loop to see if the first call site is a push
+      // loop to see if the last call site is a push
       BasicBlock::iterator tii(ti), tib = (*it3)->begin();
       for (; ; --tii) {
         CallInst *b;
@@ -450,7 +427,7 @@ private:
       if (!basicBlockIsOperable(*it)) continue;
       // at this point we have found mergable pop or peek
       PHINode* p = PHINode::Create(fn.getParent()->getFunction("pop")->
-          getReturnType());
+          getReturnType(), 0);
       // find all the call sites for the pushes
       // and remove them, adding new basic blocks on other successors
       // to this predecessor with pushes
@@ -487,9 +464,10 @@ private:
           p->addIncoming(push_f->getArgOperand(0), (*it3));
           push_f->eraseFromParent();
         }
-        // if the predecessor has other successors we make a intermediate node.
+        // if the predecessor has other successors we make intermediate nodes
         succ_iterator suc_b = succ_begin(*it3), suc_e = succ_end(*it3);
         for (; suc_b != suc_e; ++suc_b) {
+          // if we're going into the block we're making the phi in we're fine.
           if (*suc_b == &*it) {
             continue;
           }
@@ -498,18 +476,19 @@ private:
           bu.CreateCall(fn.getParent()->getFunction("push"),
               p->getIncomingValue(p->getBasicBlockIndex(*it3)));
           bu.CreateBr(*suc_b);
-          ti->setSuccessor(suc_b.getSuccessorIndex(), newInter);
           // replace phi uses
           // taken from BasicBlock.cpp
-          for (BasicBlock::iterator II = suc_b->begin(),
-              IE = suc_b->end(); II != IE; ++II) {
+          for (BasicBlock::iterator II = (*suc_b)->begin(),
+              IE = (*suc_b)->end(); II != IE; ++II) {
             PHINode *PN = dyn_cast<PHINode>(II);
             if (!PN)
               break;
             int i;
-            while ((i = PN->getBasicBlockIndex(*it3)) >= 0)
+            // only replace ONE
+            if ((i = PN->getBasicBlockIndex(*it3)) >= 0)
               PN->setIncomingBlock(i, newInter);
           }
+          ti->setSuccessor(suc_b.getSuccessorIndex(), newInter);
         }
       }
       Instruction* it2 = it->getFirstNonPHI();
@@ -525,6 +504,10 @@ private:
   }
 };
 
+// this pass finds peeks and pops that are the first stack operation in a
+// basic block and attempts to prove that they have only one value.
+// If it can prove that, then the peek or pop's uses will be substituted with
+// those of the precursor value.
 struct InterBlockMergePass2 : public FunctionPass {
   static char ID;
   InterBlockMergePass2() : FunctionPass(ID) {}
@@ -580,11 +563,10 @@ struct InterBlockMergePass2 : public FunctionPass {
         std::string cin = ci2->getCalledFunction()->getName().str();
         // if we've "wrapped around" and we're a peek we still might
         // have a chance (pops have different values each time)
-        if (ci == ci2) {
-          if (isPeek) terminated = true;
-          else return false;
+        if (cin == "peek" || ci2 == ci) {
+          terminated = true;
         // can't do anything across stack ops that aren't push
-        } else if (cin=="roll" || cin=="pop" || cin=="peek") return false;
+        } else if (cin=="roll" || cin=="pop") return false;
         else if (cin == "push") {
           if (possible_value == NULL) {
             possible_value = ci2->getArgOperand(0);
@@ -623,6 +605,13 @@ struct InterBlockMergePass2 : public FunctionPass {
   }
 };
 
+// this is a generic pass which cleans up extra cruft from the module
+//   - If the results of none of the calls to pop and peek are used,
+//     then we delete all calls to them.
+//   - If there are no pops and peeks called in the function,
+//     then all push and roll calls are deleted.
+//   - We internalize all functions that are not main
+//   - We remove noinline from all functions that are not main
 struct ModCleanupPass : public ModulePass {
   static char ID;
   ModCleanupPass() : ModulePass(ID) { }
@@ -649,6 +638,16 @@ struct ModCleanupPass : public ModulePass {
       pushes = 0;
       rolls = 0;
       res = true;
+    }
+    Module::iterator b = m.begin(), e = m.end();
+    for (; b != e; ++b) {
+      if (b->getName().str() != "main" && !b->isDeclaration()) {
+        b->setLinkage(Function::InternalLinkage);
+        res |= true;
+        if (b->getName().str().find("codel") == 0) {
+          b->removeFnAttr(Attribute::NoInline);
+        }
+      }
     }
     return res;
   }
@@ -679,6 +678,8 @@ struct ModCleanupPass : public ModulePass {
   }
 };
 
+}
+
 char PushPopMergePass::ID = 0;
 char InterBlockMergePass::ID = 0;
 char InterBlockMergePass2::ID = 0;
@@ -690,14 +691,3 @@ static RegisterPass<InterBlockMergePass> Y("interblockmerge", "Piet InterBlock m
 static RegisterPass<InterBlockMergePass2> W("interblockmerge2", "Piet InterBlock merge pass two", false, false);
 static RegisterPass<InterFuncMovePass> Z("interfuncmove", "Piet interfunc move pass", false, false);
 static RegisterPass<ModCleanupPass> A("modcleanup", "Piet module cleanup", false, false);
-
-extern "C" void AddPushPopMergePass(PyObject* o) {
-  LLVMPassManagerRef arg1 = (LLVMPassManagerRef)PyCObject_AsVoidPtr(o);
-  PassManager *pmp = reinterpret_cast<llvm::PassManager*>(arg1);
-
-  pmp->add(new PushPopMergePass());
-  pmp->add(new InterBlockMergePass());
-  pmp->add(new InterBlockMergePass2());
-  pmp->add(new InterFuncMovePass());
-  pmp->add(new ModCleanupPass());
-}

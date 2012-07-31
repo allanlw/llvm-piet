@@ -5,19 +5,20 @@ import os
 
 import llvm
 import llvm.core
-import llvm.passes
-import llvm.ee
 from PIL import Image
 import PIL.ImageColor
 import numpy
-import ctypes
 import argparse
+import subprocess
 
 from colors import *
 import ops
 
 LINKAGE = llvm.core.LINKAGE_INTERNAL
 CALL_CONV = llvm.core.CC_FASTCALL
+
+PASSES = os.path.join(os.path.split(os.path.realpath(__file__))[0],
+    "piet-passes.so")
 
 _dirs_rev = {
   "L" : "R",
@@ -235,7 +236,6 @@ class PietImage:
             to = mod.add_function(ty_cfunc, tcname)
             to.linkage = LINKAGE
             to.calling_convention = CALL_CONV
-#           to.add_attribute(llvm.core.ATTR_ALWAYS_INLINE)
             # I'm the first codel to want this target, but I don't actually
             # want it so it's just a dummy node
             if n[0:3] not in dont_bother:
@@ -291,12 +291,14 @@ class PietImage:
             d_cases.append(blocs[d_case[0]])
           else:
             bb2 = f.append_basic_block("case_"+str(i))
-            llvm.core.Builder.new(bb2).cbranch(cc, blocs[d_case[1]], blocs[d_case[0]])
+            llvm.core.Builder.new(bb2).cbranch(cc, blocs[d_case[1]],
+                blocs[d_case[0]])
             d_cases.append(bb2)
         conds = [f.append_basic_block("cond_"+self.rotcw(_dirs_rev[codel[2]], i)) for i in range(3)]
         for i in range(3):
           bu = llvm.core.Builder.new(conds[i])
-          t = bu.icmp(llvm.core.ICMP_EQ, temp, llvm.core.Constant.int(ty_int, i))
+          t = bu.icmp(llvm.core.ICMP_EQ, temp,
+              llvm.core.Constant.int(temp.type, i))
           bu.cbranch(t, d_cases[i], conds[i+1] if i < 2 else d_cases[i+1])
         builder.branch(conds[0])
       elif type == "C":
@@ -356,36 +358,35 @@ class PietImage:
         res.append(self.get_next_coords(x, y, self.rotcw(d, dp), "NOP"))
       return "D", tuple(res)
 
+def str_call(args, input):
+  p = subprocess.Popen(args, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+  p.stdin.write(input)
+  return p.communicate()[0]
+
 def run_opt(mod, pm, name, verbose, min = 1):
   last = str(mod).count("\n")
-  funcs = len(mod.functions)
   if verbose:
-    print "Starting runs of pass '{0}' (len: {1}, funcs: {2})".format(name, last, funcs)
+    print "Starting runs of pass '{0}' (len: {1})".format(name, last)
   i = 0
   while True:
     if verbose:
       print "Running passes '"+name+"'..."
-    pm.run(mod)
-    mod.verify()
+    mod = str_call(["opt-3.0", "-load="+PASSES, "-S"] + pm, mod)
     now = str(mod).count("\n")
-    now_funcs = len(mod.functions)
     i += 1
     if verbose:
-      print "Done running passes '{0}'... (len: {1}, funcs: {2})".format(name, now, now_funcs)
+      print "Done running passes '{0}'... (len: {1})".format(name, now)
     if ((min < 0 and i*-1 == min) or
-        (now >= last and now_funcs >= funcs and i >= min)):
+        (now >= last and i >= min)):
       break
     last = now
-    funcs = now_funcs
   if verbose:
-    print "Done running pass '{0}' (len: {1}, funcs: {2})".format(name, now, now_funcs)
-  
+    print "Done running pass '{0}' (len: {1})".format(name, now)
+  return mod
 
 def main():
   parser = argparse.ArgumentParser(description="Piet to LLVM Compiler")
   parser.add_argument("file", metavar="F", type=str)
-  parser.add_argument("-S", dest="ass", action="store_const", const=True,
-      default=False, help="Output LLVM IR instead of running.")
   parser.add_argument("-O", dest="opt", action="store_const", const=True,
       default=False, help="Optimize LLVM IR")
   parser.add_argument("-v", dest="verbose", action="store_const", const=True,
@@ -409,147 +410,47 @@ def main():
   if args.verbose:
     print "Done compiling..."
 
+  # after this point we now only use llvm-3.0 tools so we transform the mod
+  # into a string
+
+  mod = str(mod)
+
   if args.opt:
-    p = os.path.join(os.path.split(os.path.realpath(__file__))[0], "piet-passes.so")
-    pp = ctypes.CDLL(p)
 
     # simple, easy passes that offer a lot of benefit
     # can reduce coe size by as much as a third
-    reduce = llvm.passes.PassManager.new()
-    reduce.add(llvm.ee.TargetData.new(''))
-    reduce.add(llvm.passes.PASS_INSTRUCTION_COMBINING)
-    reduce.add(llvm.passes.PASS_REASSOCIATE)
-    reduce.add(llvm.passes.PASS_GVN)
-    reduce.add(llvm.passes.PASS_IPSCCP)
-#    reduce.add(llvm.passes.PASS_DEAD_ARG_ELIMINATION)
-#    reduce.add(llvm.passes.PASS_TAIL_CALL_ELIMINATION)
-    reduce.add(llvm.passes.PASS_DEAD_CODE_ELIMINATION)
-    reduce.add(llvm.passes.PASS_CFG_SIMPLIFICATION)
+    reduce = ["-instcombine", "-reassociate", "-gvn", "-sccp",
+        "-ipsccp", "-adce", "-simplifycfg", "-constmerge"]
 
-    always_inline = llvm.passes.PassManager.new()
-    always_inline.add(llvm.passes.PASS_ALWAYS_INLINER)
-#    always_inline.add(llvm.passes.PASS_DEAD_CODE_ELIMINATION)
+    always_inline = ["-always-inline"]
 
-    piet_spec = llvm.passes.PassManager.new()
-    pp.AddPushPopMergePass(ctypes.py_object(piet_spec.ptr))
+    piet_spec = reduce + ["-pushpopmerge", "-interblockmerge",
+        "-interblockmerge2", "-interfuncmove"]
 
-    inline = llvm.passes.PassManager.new()
-#    inline.add(llvm.passes.PASS_TAIL_CALL_ELIMINATION)
-    inline.add(llvm.passes.PASS_FUNCTION_INLINING)
-#    inline.add(llvm.passes.PASS_DEAD_CODE_ELIMINATION)
+    inline = reduce + ["-inline"]
 
-#    run_opt(mod, reduce, "reduce", args.verbose)
+    general = (["-loop-rotate", "-loop-simplify", "-indvars", "-loop-unroll"] +
+        piet_spec + reduce + ["-tailcallelim", "-inline", "-jump-threading"] +
+        reduce)
 
-    run_opt(mod, always_inline, "always inline", args.verbose, -1)
+    cleanup = ["-modcleanup", "-inline", # "-simplify-libcalls",
+        "-globaldce", "-block-placement", "-strip-dead-prototypes",
+        "-deadargelim", "-functionattrs"]
 
-    run_opt(mod, reduce, "reduce", args.verbose, -2)
+    mod = run_opt(mod, always_inline, "always inline", args.verbose, -1)
 
-    run_opt(mod, inline, "inline", args.verbose)
+    for i in range(3):
+      mod = run_opt(mod, inline, "inline", args.verbose)
 
-    run_opt(mod, reduce, "reduce", args.verbose, -2)
+      mod = run_opt(mod, piet_spec, "piet specific", args.verbose, -1)
 
-    run_opt(mod, piet_spec, "piet specific", args.verbose, -1)
+    mod = run_opt(mod, reduce, "reduce", args.verbose, -2)
 
-    run_opt(mod, reduce, "reduce", args.verbose, -2)
+    mod = run_opt(mod, general, "general", args.verbose, 8)
 
-    # force a cluster fuck
-    for fun in mod.functions:
-      if fun.name.startswith("codel") and not fun.name=="codel_0_0_L":
-#        fun.add_attribute(llvm.core.ATTR_ALWAYS_INLINE)
-#        fun.remove_attribute(llvm.core.ATTR_INLINE_HINT)
-        pass
-    run_opt(mod, inline, "inline", args.verbose)
+    mod = run_opt(mod, cleanup, "cleanup", args.verbose, -1)
 
-    run_opt(mod, reduce, "reduce", args.verbose, -2)
-
-    run_opt(mod, piet_spec, "piet specific", args.verbose, -1)
-
-    run_opt(mod, reduce, "reduce", args.verbose, -2)
-
-    run_opt(mod, inline, "inline", args.verbose)
-
-    run_opt(mod, reduce, "reduce", args.verbose, -2)
-
-    run_opt(mod, piet_spec, "piet specific", args.verbose, -1)
-
-    run_opt(mod, reduce, "reduce", args.verbose, -2)
-
-#    print mod
-
-    pm = llvm.passes.PassManager.new()
-
-    a = ctypes.py_object(pm.ptr)
-
-    pm.add( llvm.ee.TargetData.new('') )
-
-    pm.add(llvm.passes.PASS_LOOP_ROTATE)
-    pm.add(llvm.passes.PASS_LOOP_SIMPLIFY)
-    pm.add(llvm.passes.PASS_IND_VAR_SIMPLIFY)
-#    pm.add(llvm.passes.PASS_LOOP_UNROLL)
-
-    pm.add(llvm.passes.PASS_BASIC_ALIAS_ANALYSIS)
-    pm.add(llvm.passes.PASS_INSTRUCTION_COMBINING)
-    pm.add(llvm.passes.PASS_REASSOCIATE)
-    pm.add(llvm.passes.PASS_GVN)
-
-    pp.AddPushPopMergePass(a)
-
-    pm.add(llvm.passes.PASS_BASIC_ALIAS_ANALYSIS)
-    pm.add(llvm.passes.PASS_INSTRUCTION_COMBINING)
-    pm.add(llvm.passes.PASS_REASSOCIATE)
-    pm.add(llvm.passes.PASS_GVN)
-
-    pm.add(llvm.passes.PASS_SCCP)
-    pm.add(llvm.passes.PASS_IPSCCP)
-
-    pm.add(llvm.passes.PASS_TAIL_CALL_ELIMINATION)
-
-    pm.add(llvm.passes.PASS_FUNCTION_INLINING)
-
-#   This allows switch redution in llvm 2.8 but I don't think
-#   it's worth it.
-    pm.add(llvm.passes.PASS_LOWER_SWITCH)
-    pm.add(llvm.passes.PASS_JUMP_THREADING)
-    pm.add(llvm.passes.PASS_INSTRUCTION_COMBINING)
-    pm.add(llvm.passes.PASS_CFG_SIMPLIFICATION)
-    pm.add(llvm.passes.PASS_AGGRESSIVE_DCE)
-
-    del a
-
-    run_opt(mod, pm, "general", args.verbose, 8)
-
-    for fun in mod.functions:
-      if fun.name!= "main" and not fun.is_declaration:
-        fun.linkage = LINKAGE
-        # don't inline into main until here
-        if fun.name.startswith("codel"):
-          fun.remove_attribute(llvm.core.ATTR_NO_INLINE)
-
-    pm2 = llvm.passes.PassManager.new()
-    pm2.add(llvm.ee.TargetData.new('') )
-#    pm2.add(llvm.passes.PASS_LOOP_SIMPLIFY)
-#    pm2.add(llvm.passes.PASS_IND_VAR_SIMPLIFY)
-#    pm2.add(llvm.passes.PASS_LOOP_UNROLL)
-    pm2.add(llvm.passes.PASS_FUNCTION_ATTRS)
-    pm2.add(llvm.passes.PASS_FUNCTION_INLINING)
-    # doing this breaks future piet passes but oh well
-    pm2.add(llvm.passes.PASS_SIMPLIFY_LIB_CALLS)
-    pm2.add(llvm.passes.PASS_CFG_SIMPLIFICATION)
-    pm2.add(llvm.passes.PASS_AGGRESSIVE_DCE)
-    pm2.add(llvm.passes.PASS_CONSTANT_MERGE)
-    pm2.add(llvm.passes.PASS_GLOBAL_DCE)
-    pm2.add(llvm.passes.PASS_BLOCK_PLACEMENT)
-    pm2.add(llvm.passes.PASS_STRIP_DEAD_PROTOTYPES)
-    pm2.add(llvm.passes.PASS_DEAD_ARG_ELIMINATION)
-    pm2.add(llvm.passes.PASS_DEAD_TYPE_ELIMINATION)
-
-    run_opt(mod, pm2, "cleanup", args.verbose, -1)
-  if args.ass:
-    args.out.write(str(mod))
-  else:
-    ee = llvm.ee.ExecutionEngine.new(mod)
-    ee.run_static_ctors()
-    ee.run_function(mod.get_function_named("main"), [])
+  args.out.write(mod)
 
 if __name__ == "__main__":
   main()

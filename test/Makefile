@@ -19,7 +19,7 @@ clean:
 	llc -tailcallopt -O3 $^ -o $@
 
 %.ll: %.png
-	../llvm-piet.py -OSvo $@ $^
+	../llvm-piet.py -Ovo $@ $^
 
 %.png: %.foo
 	npiet-foogol -O -o $@ $^

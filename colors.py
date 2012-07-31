@@ -2,26 +2,13 @@ import PIL.ImageColor
 
 Colors = [
   PIL.ImageColor.getrgb(x) for x in (
-    "#F00",
-    "#C00000",
-    "#FFC0C0",
-    "#FF0",
-    "#C0C000",
-    "#FFFFC0",
-    "#0F0",
-    "#00C000",
-    "#C0FFC0",
-    "#0FF",
-    "#00C0C0",
-    "#C0FFFF",
-    "#00F",
-    "#0000C0",
-    "#C0C0FF",
-    "#F0F",
-    "#C000C0",
-    "#FFC0FF",
-    "#000000",
-    "#FFFFFF"
+    "#F00", "#C00000", "#FFC0C0",
+    "#FF0", "#C0C000", "#FFFFC0",
+    "#0F0", "#00C000", "#C0FFC0",
+    "#0FF", "#00C0C0", "#C0FFFF",
+    "#00F", "#0000C0", "#C0C0FF",
+    "#F0F", "#C000C0", "#FFC0FF",
+    "#000000", "#FFFFFF"
   )
 ]
 
