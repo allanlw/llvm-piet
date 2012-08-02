@@ -19,7 +19,7 @@ clean:
 	llc -tailcallopt -O3 $^ -o $@
 
 %.ll: %.png
-	../llvm-piet.py -Ovo $@ $^
+	../llvm-piet.py --lowerswitch --no-simplify-libcalls -Ovo $@ $^
 
 %.png: %.foo
 	npiet-foogol -O -o $@ $^

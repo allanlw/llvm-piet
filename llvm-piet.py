@@ -363,6 +363,7 @@ def str_call(args, input):
   p.stdin.write(input)
   return p.communicate()[0]
 
+# min < 0 means run exactly that many times, min > 0 means run at least
 def run_opt(mod, pm, name, verbose, min = 1):
   last = str(mod).count("\n")
   if verbose:
@@ -377,7 +378,7 @@ def run_opt(mod, pm, name, verbose, min = 1):
     if verbose:
       print "Done running passes '{0}'... (len: {1})".format(name, now)
     if ((min < 0 and i*-1 == min) or
-        (now >= last and i >= min)):
+        (now == last and i >= min)):
       break
     last = now
   if verbose:
@@ -395,6 +396,18 @@ def main():
       default=False, help="Enable debug output.")
   parser.add_argument("-o", dest="out", type=argparse.FileType("w", 0),
       default="-")
+  parser.add_argument("--lowerswitch", dest="lowerswitch",
+      action="store_const", const=True, default=False,
+      help="Enable lower switch optimization (used for old versions of LLVM"
+      " that do not optimize switch statements after zext correctly.")
+  parser.add_argument("--no-simplify-libcalls", dest="libcalls",
+      action="store_const", const=False, default=True,
+      help="Disable simplify lib calls (used for old versions of LLVM"
+      " that do not generate unnammed_addr attribute for puts.")
+  parser.add_argument("--no-tailcallelim", dest="tailcallelim",
+      action="store_const", const=False, default=True,
+      help="Dsiable tail call elimination (used if LLVM is having trouble"
+      " with nested + inlined eliminated tail calls)")
   args = parser.parse_args()
   
   if len(sys.argv) == 1:
@@ -429,12 +442,23 @@ def main():
 
     inline = reduce + ["-inline"]
 
-    general = (["-loop-rotate", "-loop-simplify", "-indvars", "-loop-unroll"] +
-        piet_spec + reduce + ["-tailcallelim", "-inline", "-jump-threading"] +
-        reduce)
+    # unfortunately, llvm poorly optimizes switches on things that have
+    # just been zext'd, so we use lower-switch to fix this issue.
+    general = (["-loop-rotate", "-loop-simplify", "-indvars", "-loop-unroll"]
+        + piet_spec + reduce)
+    if args.tailcallelim:
+      general += ["-tailcallelim"]
+    if args.lowerswitch:
+      general += ["-lowerswitch"]
+    general += ["-inline", "-jump-threading"] + reduce
 
-    cleanup = ["-modcleanup", "-inline", # "-simplify-libcalls",
-        "-globaldce", "-block-placement", "-strip-dead-prototypes",
+    cleanup = ["-modcleanup"]
+    if not args.tailcallelim:
+      cleanup += ["-tailcallelim"]
+    cleanup += ["-inline"] + reduce
+    if args.libcalls:
+      cleanup += ["-simplify-libcalls"]
+    cleanup += ["-globaldce", "-block-placement", "-strip-dead-prototypes",
         "-deadargelim", "-functionattrs"]
 
     mod = run_opt(mod, always_inline, "always inline", args.verbose, -1)
@@ -446,7 +470,7 @@ def main():
 
     mod = run_opt(mod, reduce, "reduce", args.verbose, -2)
 
-    mod = run_opt(mod, general, "general", args.verbose, 8)
+    mod = run_opt(mod, general, "general", args.verbose, 4)
 
     mod = run_opt(mod, cleanup, "cleanup", args.verbose, -1)
 

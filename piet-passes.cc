@@ -78,7 +78,7 @@ struct PushPopMergePass : public BasicBlockPass {
         std::string name2 = b->getCalledFunction()->getName().str();
         if (mergeTwoCalls(a, b)) {
           return _runOnBasicBlock(BB, true);
-        } else if ((isText(name2) && isText(name1)) || !isText(name2)) {
+        } else if ((isText(name1) && isText(name2)) || !isText(name2)) {
           break;
         }
       }
@@ -127,15 +127,11 @@ struct PushPopMergePass : public BasicBlockPass {
   }
 
   // tries to reduce a printf that has only constant arguments
+  // DON'T TRY THIS AT HOME FOLKS
   // return true if it did, false if it didn't
   static bool reducePrintf(CallInst* a) {
     BasicBlock& BB = *a->getParent();
-    size_t i;
-    bool flag = (a->getNumArgOperands()>1);
-    for (i = 1; i < a->getNumArgOperands(); i++) {
-      flag &= isa<ConstantInt>(a->getArgOperand(i));
-    }
-    if (!flag) return false;
+    if (a->getNumArgOperands() == 1) return false;
     GEPOperator* gepo = cast_or_null<GEPOperator>(a->getArgOperand(0));
     GlobalVariable* gv = cast_or_null<GlobalVariable>(gepo->
         getPointerOperand());
@@ -143,21 +139,37 @@ struct PushPopMergePass : public BasicBlockPass {
     if (!ca) return false;
     std::string format(ca->getAsString());
     format.resize(format.size()-1);
-    for(i = 1; i < a->getNumArgOperands(); i++) {
-      ConstantInt* d = dyn_cast<ConstantInt>(a->getArgOperand(i));
-      size_t i = format.find("%");
-      if (format[i+1] == 'c') {
-        format.replace(i, 2, std::string(1,
-           (char)d->getValue().getSExtValue()));
+    size_t start = 0;
+    std::vector<Value*> args;
+    bool operated = false;
+    for(size_t i = 1; i < a->getNumArgOperands(); i++) {
+      Value* arg = a->getArgOperand(i);
+      size_t j = format.find("%", start);
+      std::string* replacement = NULL;
+      if (isa<ConstantInt>(arg) && format[j+1] == 'c') {
+        replacement = new std::string(1, (char)cast<ConstantInt>(arg)->
+            getValue().getSExtValue());
+      } else if (isa<ConstantInt>(arg) && format[j+1] == 'd') {
+        replacement = new std::string(cast<ConstantInt>(arg)->getValue().
+            toString(10, true));
+      }
+      if (replacement && replacement->find("%") == std::string::npos) {
+        format.replace(j, 2, *replacement);
+        start = j + replacement->size();
+        delete replacement;
+        operated = true;
       } else {
-        format.replace(i, 2, d->getValue().toString(10, true));
+        start = j + 2;
+        args.push_back(arg);
       }
     }
-    IRBuilder<> bu(&BB, a);
-    Value* v1 = bu.CreateGlobalStringPtr(format);
-    bu.CreateCall(a->getCalledFunction(), v1);
-    a->eraseFromParent();
-    return true;
+    if (operated) {
+      IRBuilder<> bu(&BB, a);
+      args.insert(args.begin(), bu.CreateGlobalStringPtr(format));
+      bu.CreateCall(a->getCalledFunction(), args);
+      a->eraseFromParent();
+    }
+    return operated;
   }
 
   // tries to merge two printf statements (or debug() calls)
@@ -268,7 +280,9 @@ private:
       if (b->getName().str().find("codel") != 0) {
         continue;
       }
-      if (mostCallSitesPreceededBy(b, "push")) {
+      if (mostCallSitesPreceededBy(b, "push") ||
+          firstCallInBlock(&b->getEntryBlock(), "pop") ||
+          firstCallInBlock(&b->getEntryBlock(), "peek")) {
         Function* NF = addFunctionParamWithCall(*b, m.getFunction("pop"));
         CallInst::Create(m.getFunction("push"), &*(--NF->arg_end()),
             "", NF->getEntryBlock().getFirstNonPHI());
@@ -276,6 +290,18 @@ private:
       }
     }
     return ret;
+  }
+
+  static bool firstCallInBlock(BasicBlock* b, std::string a) {
+    for (BasicBlock::iterator i = b->begin(), e = b->end(); i != e; ++i) {
+      CallInst *c;
+      if (!(c = dyn_cast<CallInst>(i))) continue;
+      std::string cicn = c->getCalledFunction()->getName().str();
+      if (cicn == a) return true;
+      else if (cicn == "pop" || cicn == "roll" || cicn=="peek" ||
+          cicn == "push") return false;
+    }
+    return false;
   }
 
   static bool mostCallSitesPreceededBy(Function* b, std::string a) {
@@ -286,6 +312,10 @@ private:
       CallSite CS(*ui);
       Instruction* Call = CS.getInstruction();
       BasicBlock::iterator ic(Call), ib = Call->getParent()->begin();
+      if (Call->getParent()->getParent()->getName().str().find("codel")
+          != 0) {
+        return false;
+      }
       if (ic == Call->getParent()->begin()) {
         numNotFound++;
         break;
