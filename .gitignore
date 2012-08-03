@@ -1,5 +1,5 @@
 *.o
-*.ll
+*.ll*
 *.so
 *.pyc
 a.out

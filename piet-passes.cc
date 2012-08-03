@@ -1,3 +1,33 @@
+/* Copyright (c) 2012, Allan Wirth <allan@allanwirth.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *  * Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ *  * Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ *  * Neither the name of this software, nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include <llvm/Pass.h>
 #include <llvm/Support/CFG.h>
 #include <llvm/Function.h>
@@ -36,9 +66,6 @@ struct PushPopMergePass : public BasicBlockPass {
 
   virtual bool runOnBasicBlock(BasicBlock &BB) {
     return this->_runOnBasicBlock(BB);
-  }
-
-  void getAnalysisUsage(AnalysisUsage &info) const {
   }
 
   static bool _runOnBasicBlock(BasicBlock &BB, bool ret = false) {
@@ -86,6 +113,7 @@ struct PushPopMergePass : public BasicBlockPass {
     return ret;
   }
 
+private:
   // tries to unroll a 'roll' instruction if possible
   // return true if it did, false if it didn't
   static bool unrollRoll(CallInst *a) {
@@ -270,9 +298,6 @@ struct InterFuncMovePass : public ModulePass {
     return this->_runOnModule(m);
   }
 
-  void getAnalysisUsage(AnalysisUsage &info) const {
-  }
-
 private:
   bool _runOnModule(Module& m, bool ret = false) {
     Module::iterator b = m.begin(), e = m.end();
@@ -280,7 +305,7 @@ private:
       if (b->getName().str().find("codel") != 0) {
         continue;
       }
-      if (mostCallSitesPreceededBy(b, "push") ||
+      if (mostCallSitesPreceededByPush(b) ||
           firstCallInBlock(&b->getEntryBlock(), "pop") ||
           firstCallInBlock(&b->getEntryBlock(), "peek")) {
         Function* NF = addFunctionParamWithCall(*b, m.getFunction("pop"));
@@ -304,9 +329,13 @@ private:
     return false;
   }
 
-  static bool mostCallSitesPreceededBy(Function* b, std::string a) {
+  static bool mostCallSitesPreceededByPush(Function* b) {
     Function::use_iterator ui(b->use_begin()), ue(b->use_end());
+    // number of call sites that are preceded by a push
     unsigned numFound = 0;
+    // number of call sites that are safe to add a pop before but do not have
+    // a push. we assume that if there was a peek or a roll then the execution
+    // would have already terminated if the stack was empty
     unsigned numNotFound = 0;
     for (; ui != ue; ++ui) {
       CallSite CS(*ui);
@@ -317,8 +346,7 @@ private:
         return false;
       }
       if (ic == Call->getParent()->begin()) {
-        numNotFound++;
-        break;
+        return false;
       }
       bool found = false;
       do {
@@ -326,15 +354,14 @@ private:
         CallInst* cic;
         if (!(cic = dyn_cast<CallInst>(ic))) continue;
         std::string cicn = cic->getCalledFunction()->getName().str();
-        if (cicn == a) {
+        if (cicn == "push") {
           found = true;
           break;
-        } else if (cicn == "pop" || cicn == "roll" || cicn == "peek" ||
-            cicn=="push") {
+        } else if (cicn == "roll" || cicn == "peek") {
           break;
-        }
+        } else if (cicn == "pop") return false;
       } while (ic != ib);
-      if (found) ++numFound;
+      if (found == true) ++numFound;
       else ++numNotFound;
     }
     return numFound >= numNotFound + 1;
@@ -394,9 +421,6 @@ struct InterBlockMergePass : public FunctionPass {
 
   virtual bool runOnFunction(Function& fn) {
     return this->_runOnFunction(fn);
-  }
-
-  void getAnalysisUsage(AnalysisUsage &info) const {
   }
 
 private:
@@ -566,7 +590,6 @@ struct InterBlockMergePass2 : public FunctionPass {
   // precondition: this must be the first stack operation in the basic block!
   // return true on success and false on failure (uncertainty)
   static bool proveValue(CallInst* ci) {
-    bool isPeek = (ci->getCalledFunction()->getName().str()=="peek");
     std::deque<BasicBlock*> preds;
     std::set<BasicBlock*> scanned;
     // doesn't work on entry blocks
@@ -593,7 +616,7 @@ struct InterBlockMergePass2 : public FunctionPass {
         std::string cin = ci2->getCalledFunction()->getName().str();
         // if we've "wrapped around" and we're a peek we still might
         // have a chance (pops have different values each time)
-        if (cin == "peek" || ci2 == ci) {
+        if (cin == "peek" && ci2 == ci) {
           terminated = true;
         // can't do anything across stack ops that aren't push
         } else if (cin=="roll" || cin=="pop") return false;
@@ -649,12 +672,10 @@ struct ModCleanupPass : public ModulePass {
   virtual bool runOnModule(Module& m) {
     unsigned peeks = countFunctionUses(m, "peek"),
         pops = countFunctionUses(m, "pop"),
-        pushes = countFunctionUses(m, "push"),
-        rolls = countFunctionUses(m, "roll"),
         pops_used = countFunctionReturnUses(m, "pop"),
         peeks_used = countFunctionReturnUses(m, "peek");
     bool res = false;
-    // WARNING THIS COULD GET RID OF WARNING MESSAGES
+    // WARNING THIS COULD GET RID OF WARNING MESSAGES so this is unsafe
     if (pops_used == 0 && peeks_used == 0) {
       deleteAllCalls(m, "pop");
       deleteAllCalls(m, "peek");
@@ -665,8 +686,6 @@ struct ModCleanupPass : public ModulePass {
     if (peeks == 0 && pops == 0) {
       deleteAllCalls(m, "push");
       deleteAllCalls(m, "roll");
-      pushes = 0;
-      rolls = 0;
       res = true;
     }
     Module::iterator b = m.begin(), e = m.end();
