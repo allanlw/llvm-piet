@@ -27,5 +27,5 @@ clean-inter:
 %.ll.ls: %.png
 	../llvm-piet.py --no-simplify-libcalls --lowerswitch -Ovo $@ $^
 
-%.png: %.foo
-	npiet-foogol -O -o $@ $^
+#%.png: %.foo
+#	npiet-foogol -O -o $@ $^

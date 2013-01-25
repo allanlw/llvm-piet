@@ -11,7 +11,7 @@ piet-passes.so: piet-passes.o
 # the sed command is a hack because llvm-piet only supports llvm 3.0
 pushpop.ll: pushpop.cc
 #	llvmc-2.8 -o $@ $^ -emit-llvm -fplugin-arg-dragonegg-emit-ir -S
-	clang -o - $^ -emit-llvm -S -O3 -fno-exceptions | sed "s/unnamed_addr//g" > $@
+	clang -o - $^ -emit-llvm -S -O3 -fno-exceptions | sed "s/unnamed_addr//g" | sed "s/uwtable//g" > $@
 
 #ops.ll:
 #	python ops.py > ops.ll
