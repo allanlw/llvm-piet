@@ -124,6 +124,14 @@ def simple(pfn):
   wrapper.__name__ = pfn.__name__
   return noret(noarg(build(pushpop(wrapper))))
 
+def noinline(pfn):
+  def wrapper(m, fn, *args):
+    fn.remove_attribute(llvm.core.ATTR_ALWAYS_INLINE)
+    pfn(m, fn, *args)
+  wrapper.__name__ = pfn.__name__
+  return wrapper
+
+
 # definitions for actual piet function intrinsics
 
 @noret
@@ -201,10 +209,12 @@ def OUC(m, fn, bb, bu, pu, po):
   printf(m, bu, "pc", bu.call(po, []))
 
 @simple
+@noinline
 def INN(m, fn, bb, bu, pu, po):
   bu.call(pu, [scanf(m, bu, "pd")])
 
 @simple
+@noinline
 def INC(m, fn, bb, bu, pu, po):
   bu.call(pu, [scanf(m, bu, "pc")])
 
