@@ -92,7 +92,7 @@ extern "C" void roll(int depth, int times) {
     return;
   } else if (depth > stack->size()) {
     fprintf(stderr,
-        "Error: Roll with depth (%d) larger than stack size (%d).",
+        "Error: Roll with depth (%d) larger than stack size (%lu).",
         depth, stack->size());
     exit(1);
     return;
