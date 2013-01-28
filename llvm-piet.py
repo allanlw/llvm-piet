@@ -152,7 +152,7 @@ class PietImage:
     else:
       return r
 
-  def compile(self, debug):
+  def compile(self, debug, st_size):
     # These are the types for the code we generate
     self._ty_int = llvm.core.Type.int()
     self._ty_cfunc = llvm.core.Type.function(llvm.core.Type.void(),
@@ -162,12 +162,11 @@ class PietImage:
     self._mod = ops.setup_module()
 
     # storage for branches we didn't bother generating (just made stubs)
-    self._didnt_bother = set()
-    # map to check if when reentering a function we have the predicted value
-    self._double_check = {}
+    self._didnt_generate = set()
 
-    self._generated = set()
-    self._codel_queue = [(0, 0, "L", None)]
+    # this maps codels to a set of predicted values they have been generated for
+    self._generated = {}
+    self._codel_queue = [(0, 0, "L", (None,)*st_size)]
 
     # Entry function
     top = self._mod.add_function(self._ty_cfunc, self.get_codel_name(*self._codel_queue[0][0:3]))
@@ -182,75 +181,72 @@ class PietImage:
       block = self.blocks[codel[0:2]]
       cname = self.get_codel_name(*codel[0:3])
 
-      self._generated.add(codel[0:3])
-
-      f = self._mod.get_function_named(cname)
-      cc = f.args[0]
-      builder = llvm.core.Builder.new(f.append_basic_block("entry"))
-
       # other is the previous block
       other = self.getrel(codel[2], codel[0], codel[1])
       saved = codel[3]
 
-      bc = block.color
-      if other is None:
-        op = "NOP" # we didn't come from anywhere (first instruction)
-        oc = None
-      else:
-        oc = self.blocks[other].color
-        op = get_op(oc, bc)
+      # function we're working on
+      f = self._mod.get_function_named(cname)
+      cc = f.args[0]
+
+      # if other is None we didn't come from anywhere (first instruction)
+      op = get_op(self.blocks[other].color, block.color) if other is not None else "NOP"
+
+      brtype, next_codels = self.get_next_coords(codel[0], codel[1], codel[2], op)
+
+      n_saved = self._get_next_saved(saved, op, other)
+
+      # get rid of any impression we haven't generated this block
+      self._didnt_generate.discard(codel[0:3])
+
+      if codel[0:3] not in self._generated:
+        self._generated[codel[0:3]] = set([saved])
+      # we already generated this block with these params
+      elif self._less_general_version(self._generated[codel[0:3]], saved):
+        continue
+      else: # we have already generated this block once
+        # all we have to do is re-generate any next level calls that are possible
+        self._generated[codel[0:3]].add(saved)
+        for target in self._possible_nexts(brtype, next_codels, self._generated[codel[0:3]]):
+          if target is not None:
+            self._codel_queue.append(target[0:3] + (n_saved,))
+        continue
+
+      builder = llvm.core.Builder.new(f.append_basic_block("entry"))
 
       if debug:
-        ops.debug(self._mod, builder, op, codel + (oc, bc))
+        ops.debug(self._mod, builder, op,
+            codel + ((self.blocks[other].color if other is not None else None),
+            block.color))
 
-      n_saved = None
-      if op in ("NOP", "DUP"):
-        n_saved = saved
       if op == "PUSH":
-        n_saved = len(self.blocks[other].codels)
         temp = builder.call(self._mod.get_function_named(op),
-            [llvm.core.Constant.int(self._ty_int, n_saved)])
+            [llvm.core.Constant.int(self._ty_int, n_saved[-1])])
       elif op == "SW":
-        temp = builder.call(self._mod.get_function_named(op),[cc])
+        temp = builder.call(self._mod.get_function_named(op), [cc])
         cc = temp
       else:
         temp = builder.call(self._mod.get_function_named(op), [])
 
-      type, next = self.get_next_coords(codel[0], codel[1], codel[2], op)
       blocs = {}
-      flat_dont_bother = set()
-      if (type == "D" and
-          saved is not None and saved in range(4) and
-          codel[0:3] not in next[saved][1]):  # can't do anything if I call myself
-        dont_bother = []
-        do_bother = [x[0:3] for x in next[saved][1]]
-        for i in range(4):
-          dont_bother.append([])
-          if i == saved: continue
-          for ncodel in next[i][1]:
-            if ncodel[0:3] not in do_bother:
-              # functions called by branches I hope not to take don't need
-              # to be generated
-              dont_bother[i].append(ncodel[0:3])
-              flat_dont_bother.add(ncodel[0:3])
-        # if we renter this function w/o the predicted value
-        # we need to generate all those functions
-        self._double_check[codel[0:3]] = dont_bother
+      possible_nexts = self._possible_nexts(brtype, next_codels, self._generated[codel[0:3]])
 
-      if type != "D":
-        nexts = next
-      else:
-        nexts = []
-        for x in next:
-          nexts.extend(x[1])
+      for i, target in enumerate(self._all_nexts(brtype, next_codels)):
+        # duplicate target
+        if target in blocs:
+          continue
 
-      for i,n in enumerate(nexts):
-        self._generate_basic_block(f, blocs, i, n, cc, builder, next,
-            n_saved, flat_dont_bother)
+        if target in possible_nexts and target is not None:
+          self._codel_queue.append(target[0:3] + (n_saved,))
+        elif target not in self._generated and target is not None:
+          self._didnt_generate.add(target[0:3])
 
-      if type == "D":
+        blocs[target] = self._generate_basic_block(f, i, target, cc, builder, next_codels,
+          n_saved)
+
+      if brtype == "D":
         d_cases = []
-        for i, (d_type, d_case) in enumerate(next):
+        for i, (d_type, d_case) in enumerate(next_codels):
           if d_type in ("J", "K"):
             d_cases.append(blocs[d_case[0]])
           else: # C
@@ -262,35 +258,34 @@ class PietImage:
         for i in range(3):
           swi.add_case(llvm.core.Constant.int(llvm.core.Type.int(2), i),
               d_cases[i])
-      elif type == "C":
-        builder.cbranch(cc, blocs[nexts[1]], blocs[nexts[0]])
+      elif brtype == "C":
+        builder.cbranch(cc, blocs[next_codels[1]], blocs[next_codels[0]])
 
-      if type in ("J", "K", "C"):
+      if brtype in ("J", "K", "C"):
         f.add_attribute(llvm.core.ATTR_INLINE_HINT)
 
-    for codel in self._didnt_bother:
+    for codel in self._didnt_generate:
       f = self._mod.get_function_named(self.get_codel_name(*codel))
+      f.add_attribute(llvm.core.ATTR_INLINE_HINT)
       bb3 = f.append_basic_block("entry")
       llvm.core.Builder.new(bb3).ret_void()
     return self._mod
   def get_codel_name(self, x, y, d):
     return "codel_{0}_{1}_{2}".format(x, y, d)
-  def _generate_basic_block(self, f, blocs, i, n, cc, builder, next,
-    n_saved, flat_dont_bother):
+  def _generate_basic_block(self, f, i, n, cc, builder, next, n_saved):
     # if this is a duplicate target, don't remake a block
-    if n in blocs:
-      return
     # if this is the only target, don't make a block
-    elif len(next) == 1:
+    if len(next) == 1:
       bu = builder
+      my_bloc = None
     else:
-      blocs[n] = f.append_basic_block("out_{0}".format(i))
-      bu = llvm.core.Builder.new(blocs[n])
+      my_bloc = f.append_basic_block("out_{0}".format(i))
+      bu = llvm.core.Builder.new(my_bloc)
 
     if n is None:
       bu.call(self._mod.get_function_named("EXIT"), [])
       bu.ret_void()
-      return
+      return my_bloc
 
     tcname = self.get_codel_name(*n[0:3])
     try:
@@ -299,48 +294,7 @@ class PietImage:
       to = self._mod.add_function(self._ty_cfunc, tcname)
       to.linkage = LINKAGE
       to.calling_convention = CALL_CONV
-      # I'm the first codel to want this target, but I don't actually
-      # want it so it's just a dummy node
-      if n[0:3] not in flat_dont_bother:
-        self._codel_queue.append(n[0:3] + (n_saved,))
-      else:
-        self._didnt_bother.add(n[0:3])
-    else:
-      # if we actually might get there
-      if n[0:3] not in flat_dont_bother:
-        # if we're going into a function that we made an assumption about
-        # that no longer holds true, we need to generate the other places
-        # it might go
-        # note this can never be me because I can't be in double_check
-        # if I am a target
-        if n[0:3] in self._double_check:
-          if n_saved is None:
-            for y in self._double_check[n[0:3]]:
-              for x in y:
-                if x in self._didnt_bother:
-                  self._codel_queue.append(x+(None,))
-                  self._didnt_bother.remove(x)
-            del self._double_check[n[0:3]]
-          else:
-            for x in self._double_check[n[0:3]][n_saved]:
-              if x in self._didnt_bother:
-                self._codel_queue.append(x +(None,))
-                self._didnt_bother.remove(x)
-            self._double_check[n[0:3]][n_saved] = []
-        # if we're going into a function we assumed wouldn't be called
-        # we need to generate it
-        elif n[0:3] in self._didnt_bother:
-          self._didnt_bother.remove(n[0:3])
-          self._codel_queue.append(n[0:3]+(None,))
-        # this is currently queued for generation so we have to check
-        # the generation queue and make sure that the predicted
-        # value matches. if it doesn't, then we invalidate both.
-        elif n[0:3] not in self._generated:
-          for i in range(len(self._codel_queue)):
-            if self._codel_queue[i][0:3] == n[0:3]:
-              if self._codel_queue[i][3] != n_saved:
-                self._codel_queue[i] = n[0:3] + (None,)
-              break
+
     if n[3] == -1:
       ncc = cc
     elif n[3] == -2:
@@ -352,6 +306,33 @@ class PietImage:
     d.calling_convention = CALL_CONV
     llvm.core._core.LLVMSetTailCall(d.ptr, True)
     bu.ret_void()
+    return my_bloc
+
+  def _possible_nexts(self, brtype, next_codels, choices):
+    if brtype != "D":
+      return next_codels
+
+    actual_choices = set(x[-1]%4 if x[-1] is not None else None for x in choices)
+    res = []
+    for i in range(4):
+      if None in actual_choices or i in actual_choices:
+        res.extend(next_codels[i][1])
+    return res
+
+  def _all_nexts(self, brtype, next_codels):
+    if brtype != "D":
+      return next_codels
+    else:
+      res = []
+      for n in next_codels:
+        res.extend(n[1])
+      return res
+
+  def _less_general_version(self, versions, candidate):
+    for version in versions:
+      if all(version[i] == None or version[i] == candidate[i] for i in range(len(candidate))):
+        return True
+    return False
 
   def _make_main(self, top):
     main = self._mod.add_function(llvm.core.Type.function(llvm.core.Type.int(),
@@ -362,6 +343,54 @@ class PietImage:
     e.calling_convention = CALL_CONV
     mb.ret(llvm.core.Constant.int(llvm.core.Type.int(), 0))
     return main
+
+  def _get_next_saved(self, last_saved, op, other):
+    if op == "DUP":
+      return last_saved[1:] + (last_saved[-1],)
+    elif op == "NOP":
+      return last_saved
+    elif op == "PUSH":
+      return last_saved[1:] + (len(self.blocks[other].codels),)
+    elif op in ("INC", "INN"):
+      return last_saved[1:] + (None,)
+    elif op in ("OUC", "OUN", "POP", "SW", "DP"):
+      return (None,) + last_saved[0:-1]
+    elif op in ("ADD", "SUB", "MUL", "DIV", "MOD", "GT"):
+      a = last_saved[-1]
+      b = last_saved[-2]
+      if a is None or b is None:
+        res = None
+      elif op == "ADD":
+        res = a + b
+      elif op == "SUB":
+        res = b - a
+      elif op == "MUL":
+        res = b * a
+      elif op == "DIV":
+        try:
+          res = b / a
+        except ZeroDivisionError:
+          res = None
+      elif op == "MOD":
+        try:
+          res = b % a
+        except ZeroDivisionError:
+          res = None
+      elif op == "GT":
+        res = b > a
+      return (None,) + last_saved[0:-2] + (res,)
+    elif op == "NOT":
+      a = last_saved[-1]
+      if a is None:
+        res = None
+      else:
+        res = int(not a)
+      return last_saved[0:-1] + (res,)
+    elif op == "ROL":
+      return (None,)*len(last_saved)
+    else:
+      print "WUT", op
+      sys.exit(1)
 
   # Determine where to go after this block
   # return codes: "J" unconditional jump
@@ -444,6 +473,8 @@ def main():
       default=False, help="Enable debug output.")
   parser.add_argument("-o", dest="out", type=argparse.FileType("w", 0),
       default="-")
+  parser.add_argument("--stack-pred-size", dest="st_size", type=int,
+      default=3)
   parser.add_argument("--lowerswitch", dest="lowerswitch",
       action="store_const", const=True, default=False,
       help="Enable lower switch optimization (used for old versions of LLVM"
@@ -467,7 +498,7 @@ def main():
   if args.verbose:
     print "Done loading image..."
     print "compiling..."
-  mod = im.compile(args.debug)
+  mod = im.compile(args.debug, args.st_size)
   if args.verbose:
     print "Done compiling..."
 
