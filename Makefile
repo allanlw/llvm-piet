@@ -3,7 +3,7 @@
 all: piet-passes.so pushpop.ll
 
 piet-passes.o: piet-passes.cc
-	g++ -o $@ $^ -c -g -fPIC -O2 -Wall `llvm-config-3.0 --cxxflags` -Wextra
+	g++ -o $@ $^ -c -g -fPIC -O2 -Wall `llvm-config-3.2 --cxxflags` -Wextra
 
 piet-passes.so: piet-passes.o
 	g++ -o $@ -shared $^ -Wl,-soname,$@ -fPIC -Wall -g

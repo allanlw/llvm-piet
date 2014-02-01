@@ -35,8 +35,9 @@
 #include <llvm/BasicBlock.h>
 #include <llvm/PassManager.h>
 #include <llvm/Module.h>
+#include <llvm/Attributes.h>
 #include <llvm/Operator.h>
-#include <llvm/Support/IRBuilder.h>
+#include <llvm/IRBuilder.h>
 #include <llvm/Support/CallSite.h>
 #include <llvm/PassManagers.h>
 #include <llvm/Constants.h>
@@ -163,9 +164,9 @@ private:
     GEPOperator* gepo = cast_or_null<GEPOperator>(a->getArgOperand(0));
     GlobalVariable* gv = cast_or_null<GlobalVariable>(gepo->
         getPointerOperand());
-    ConstantArray* ca = cast_or_null<ConstantArray>(gv->getInitializer());
-    if (!ca) return false;
-    std::string format(ca->getAsString());
+    ConstantDataSequential* ca = cast_or_null<ConstantDataSequential>(gv->getInitializer());
+    if (!ca || !ca->isCString()) return false;
+    std::string format(ca->getAsCString());
     format.resize(format.size()-1);
     size_t start = 0;
     std::vector<Value*> args;
@@ -214,15 +215,16 @@ private:
         !(f2 = dyn_cast<GlobalVariable>(s2->getPointerOperand()))) {
       return false;
     }
-    ConstantArray *a1, *a2;
-    if (!(a1 = dyn_cast<ConstantArray>(f1->getInitializer())) ||
-        !(a2 = dyn_cast<ConstantArray>(f2->getInitializer()))) {
+    ConstantDataSequential *a1, *a2;
+    if (!(a1 = dyn_cast<ConstantDataSequential>(f1->getInitializer())) ||
+        !(a2 = dyn_cast<ConstantDataSequential>(f2->getInitializer())) ||
+        !a1->isCString() || !a2->isCString()) {
       return false;
     }
-    std::string nc = a1->getAsString();
+    std::string nc = a1->getAsCString();
     nc.resize(nc.size()-1); // chop off null terminator
     if (a->getCalledFunction()->getName().str() == "debug") nc.append("+");
-    nc.append(a2->getAsString());
+    nc.append(a2->getAsCString());
     nc.resize(nc.size()-1); // chop off null terminator
 
     IRBuilder<> bu(&BB, b);
@@ -694,7 +696,7 @@ struct ModCleanupPass : public ModulePass {
         b->setLinkage(Function::InternalLinkage);
         res |= true;
         if (b->getName().str().find("codel") == 0) {
-          b->removeFnAttr(Attribute::NoInline);
+          b->removeFnAttr(Attributes::get(m.getContext(), Attributes::NoInline));
         }
       }
     }
